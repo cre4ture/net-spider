@@ -19,7 +19,7 @@ use rp2040_hal::watchdog::Watchdog;
 
 const XTAL_FREQ_HZ: u32 = 12_000_000;
 const COMMAND_BUFFER_LEN: usize = 64;
-const CONTROL_PINS: [u8; 4] = [2, 3, 4, 5];
+const CONTROL_PINS: [u8; 8] = [2, 3, 4, 5, 6, 7, 8, 9];
 const NETWORK_CONFIG: NetworkConfig = NetworkConfig {
     mode: NetworkMode::TcpServer,
     local_ip: [192, 168, 1, 200],
@@ -60,15 +60,15 @@ enum ParsedCommand {
 }
 
 struct CommandPins {
-    pin_numbers: [u8; 4],
-    states: [DriveState; 4],
+    pin_numbers: [u8; 8],
+    states: [DriveState; 8],
 }
 
 impl CommandPins {
-    fn new(pin_numbers: [u8; 4]) -> Self {
+    fn new(pin_numbers: [u8; 8]) -> Self {
         let controller = Self {
             pin_numbers,
-            states: [DriveState::Neutral; 4],
+            states: [DriveState::Neutral; 8],
         };
 
         controller.apply_mask_state(controller.mask(), DriveState::Neutral);
@@ -151,6 +151,10 @@ fn main() -> ! {
     let _gp3 = pins.gpio3.into_floating_input();
     let _gp4 = pins.gpio4.into_floating_input();
     let _gp5 = pins.gpio5.into_floating_input();
+    let _gp6 = pins.gpio6.into_floating_input();
+    let _gp7 = pins.gpio7.into_floating_input();
+    let _gp8 = pins.gpio8.into_floating_input();
+    let _gp9 = pins.gpio9.into_floating_input();
 
     let config_uart = UartPeripheral::new(pac.UART1, uart_pins, &mut pac.RESETS)
         .enable(
@@ -181,7 +185,7 @@ fn main() -> ! {
     let _ = write!(
         uart,
         "\r\nRP2040-ETH ready at {}.{}.{}.{}:{}\r\n\
-P1=GP2 P2=GP3 P3=GP4 P4=GP5\r\n\
+P1=GP2 P2=GP3 P3=GP4 P4=GP5 P5=GP6 P6=GP7 P7=GP8 P8=GP9\r\n\
 Try HELP, STATUS, P1 ON, or ALL NEUTRAL\r\n",
         NETWORK_CONFIG.local_ip[0],
         NETWORK_CONFIG.local_ip[1],
@@ -263,17 +267,21 @@ fn process_line<P>(
         Ok(ParsedCommand::Help) => {
             let _ = write!(
                 uart,
-                "OK commands: HELP, STATUS, P1..P4 ON|OFF|NEUTRAL, ALL ON|OFF|NEUTRAL\r\n"
+                "OK commands: HELP, STATUS, P1..P8 ON|OFF|NEUTRAL, ALL ON|OFF|NEUTRAL\r\n"
             );
         }
         Ok(ParsedCommand::Status) => {
             let _ = write!(
                 uart,
-                "STATUS GP2={} GP3={} GP4={} GP5={}\r\n",
+                "STATUS GP2={} GP3={} GP4={} GP5={} GP6={} GP7={} GP8={} GP9={}\r\n",
                 controlled_pins.states[0].label(),
                 controlled_pins.states[1].label(),
                 controlled_pins.states[2].label(),
                 controlled_pins.states[3].label(),
+                controlled_pins.states[4].label(),
+                controlled_pins.states[5].label(),
+                controlled_pins.states[6].label(),
+                controlled_pins.states[7].label(),
             );
         }
         Ok(ParsedCommand::SetOne { slot, state }) => {
@@ -367,7 +375,35 @@ fn parse_slot(token: &str) -> Result<usize, &'static str> {
         return Ok(3);
     }
 
-    Err("unknown pin, use P1..P4 or GP2..GP5")
+    if token.eq_ignore_ascii_case("P5")
+        || token.eq_ignore_ascii_case("5")
+        || token.eq_ignore_ascii_case("GP6")
+    {
+        return Ok(4);
+    }
+
+    if token.eq_ignore_ascii_case("P6")
+        || token.eq_ignore_ascii_case("6")
+        || token.eq_ignore_ascii_case("GP7")
+    {
+        return Ok(5);
+    }
+
+    if token.eq_ignore_ascii_case("P7")
+        || token.eq_ignore_ascii_case("7")
+        || token.eq_ignore_ascii_case("GP8")
+    {
+        return Ok(6);
+    }
+
+    if token.eq_ignore_ascii_case("P8")
+        || token.eq_ignore_ascii_case("8")
+        || token.eq_ignore_ascii_case("GP9")
+    {
+        return Ok(7);
+    }
+
+    Err("unknown pin, use P1..P8 or GP2..GP9")
 }
 
 fn parse_state(token: &str) -> Result<DriveState, &'static str> {
@@ -402,6 +438,10 @@ fn pin_label(slot: usize) -> &'static str {
         1 => "GP3",
         2 => "GP4",
         3 => "GP5",
+        4 => "GP6",
+        5 => "GP7",
+        6 => "GP8",
+        7 => "GP9",
         _ => "UNKNOWN",
     }
 }
