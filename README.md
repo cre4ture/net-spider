@@ -15,7 +15,7 @@ exposed as tri-state channels:
 - `P7` -> `GP8`
 - `P8` -> `GP9`
 
-`ON` drives the pin high, `OFF` drives the pin low, and `NEUTRAL` makes the pin
+`HIGH` drives the pin high, `LOW` drives the pin low, and `HI-Z` makes the pin
 high impedance again.
 
 ## Default network settings
@@ -35,20 +35,20 @@ The parser accepts either direct commands or a `SET` prefix:
 ```text
 HELP
 STATUS
-P1 ON
-P5 OFF
-P8 NEUTRAL
-SET P4 ON
-ALL OFF
+P1 HIGH
+P5 LOW
+P8 HI-Z
+SET P4 H
 ALL Z
 ```
 
-Aliases:
+Preferred state names are `HIGH`, `LOW`, and `HI-Z`. The parser also accepts
+these aliases:
 
 - Pin selectors: `P1`..`P8`, `1`..`8`, `GP2`..`GP9`
-- High: `ON`, `HIGH`, `1`
-- Low: `OFF`, `LOW`, `0`
-- High impedance: `NEUTRAL`, `FLOAT`, `Z`, `HI-Z`
+- High: `H`, `ON`, `1`
+- Low: `L`, `OFF`, `0`
+- High impedance: `Z`, `NEUTRAL`, `FLOAT`
 
 ## Build
 

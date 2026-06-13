@@ -37,17 +37,17 @@ pub static BOOT2: [u8; 256] = rp2040_boot2::BOOT_LOADER_GENERIC_03H;
 
 #[derive(Clone, Copy)]
 enum DriveState {
-    On,
-    Off,
-    Neutral,
+    High,
+    Low,
+    HiZ,
 }
 
 impl DriveState {
     const fn label(self) -> &'static str {
         match self {
-            Self::On => "ON",
-            Self::Off => "OFF",
-            Self::Neutral => "NEUTRAL",
+            Self::High => "HIGH",
+            Self::Low => "LOW",
+            Self::HiZ => "HI-Z",
         }
     }
 }
@@ -68,10 +68,10 @@ impl CommandPins {
     fn new(pin_numbers: [u8; 8]) -> Self {
         let controller = Self {
             pin_numbers,
-            states: [DriveState::Neutral; 8],
+            states: [DriveState::HiZ; 8],
         };
 
-        controller.apply_mask_state(controller.mask(), DriveState::Neutral);
+        controller.apply_mask_state(controller.mask(), DriveState::HiZ);
         controller
     }
 
@@ -96,15 +96,15 @@ impl CommandPins {
         let sio = unsafe { &*pac::SIO::ptr() };
 
         match state {
-            DriveState::On => {
+            DriveState::High => {
                 sio.gpio_out_set().write(|w| unsafe { w.bits(mask) });
                 sio.gpio_oe_set().write(|w| unsafe { w.bits(mask) });
             }
-            DriveState::Off => {
+            DriveState::Low => {
                 sio.gpio_out_clr().write(|w| unsafe { w.bits(mask) });
                 sio.gpio_oe_set().write(|w| unsafe { w.bits(mask) });
             }
-            DriveState::Neutral => {
+            DriveState::HiZ => {
                 sio.gpio_oe_clr().write(|w| unsafe { w.bits(mask) });
             }
         }
@@ -186,7 +186,7 @@ fn main() -> ! {
         uart,
         "\r\nRP2040-ETH ready at {}.{}.{}.{}:{}\r\n\
 P1=GP2 P2=GP3 P3=GP4 P4=GP5 P5=GP6 P6=GP7 P7=GP8 P8=GP9\r\n\
-Try HELP, STATUS, P1 ON, or ALL NEUTRAL\r\n",
+Try HELP, STATUS, P1 HIGH, or ALL HI-Z\r\n",
         NETWORK_CONFIG.local_ip[0],
         NETWORK_CONFIG.local_ip[1],
         NETWORK_CONFIG.local_ip[2],
@@ -267,7 +267,7 @@ fn process_line<P>(
         Ok(ParsedCommand::Help) => {
             let _ = write!(
                 uart,
-                "OK commands: HELP, STATUS, P1..P8 ON|OFF|NEUTRAL, ALL ON|OFF|NEUTRAL\r\n"
+                "OK commands: HELP, STATUS, P1..P8 HIGH|LOW|HI-Z, ALL HIGH|LOW|HI-Z; short H|L|Z\r\n"
             );
         }
         Ok(ParsedCommand::Status) => {
@@ -407,41 +407,43 @@ fn parse_slot(token: &str) -> Result<usize, &'static str> {
 }
 
 fn parse_state(token: &str) -> Result<DriveState, &'static str> {
-    if token.eq_ignore_ascii_case("ON")
-        || token.eq_ignore_ascii_case("HIGH")
+    if token.eq_ignore_ascii_case("HIGH")
+        || token.eq_ignore_ascii_case("H")
+        || token.eq_ignore_ascii_case("ON")
         || token.eq_ignore_ascii_case("1")
     {
-        return Ok(DriveState::On);
+        return Ok(DriveState::High);
     }
 
-    if token.eq_ignore_ascii_case("OFF")
-        || token.eq_ignore_ascii_case("LOW")
+    if token.eq_ignore_ascii_case("LOW")
+        || token.eq_ignore_ascii_case("L")
+        || token.eq_ignore_ascii_case("OFF")
         || token.eq_ignore_ascii_case("0")
     {
-        return Ok(DriveState::Off);
+        return Ok(DriveState::Low);
     }
 
-    if token.eq_ignore_ascii_case("NEUTRAL")
-        || token.eq_ignore_ascii_case("FLOAT")
+    if token.eq_ignore_ascii_case("HI-Z")
         || token.eq_ignore_ascii_case("Z")
-        || token.eq_ignore_ascii_case("HI-Z")
+        || token.eq_ignore_ascii_case("NEUTRAL")
+        || token.eq_ignore_ascii_case("FLOAT")
     {
-        return Ok(DriveState::Neutral);
+        return Ok(DriveState::HiZ);
     }
 
-    Err("unknown state, use ON, OFF, or NEUTRAL")
+    Err("unknown state, use HIGH, LOW, or HI-Z")
 }
 
 fn pin_label(slot: usize) -> &'static str {
     match slot {
-        0 => "GP2",
-        1 => "GP3",
-        2 => "GP4",
-        3 => "GP5",
-        4 => "GP6",
-        5 => "GP7",
-        6 => "GP8",
-        7 => "GP9",
+        0 => "GP2(P1)",
+        1 => "GP3(P2)",
+        2 => "GP4(P3)",
+        3 => "GP5(P4)",
+        4 => "GP6(P5)",
+        5 => "GP7(P6)",
+        6 => "GP8(P7)",
+        7 => "GP9(P8)",
         _ => "UNKNOWN",
     }
 }
