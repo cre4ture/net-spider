@@ -42,9 +42,22 @@ jobs:
       - name: Build release firmware
         run: cargo build --release --target $TARGET
 
+      - name: Install UF2 packer
+        run: cargo install elf2uf2-rs --locked
+
+      - name: Build UF2 firmware
+        run: elf2uf2-rs target/$TARGET/release/net-spider target/$TARGET/release/net-spider.uf2
+
       - name: Upload release ELF
         uses: actions/upload-artifact@v4
         with:
-          name: net-spider-${{ env.TARGET }}-release
+          name: net-spider-${{ env.TARGET }}-elf
           path: target/${{ env.TARGET }}/release/net-spider
+          if-no-files-found: error
+
+      - name: Upload release UF2
+        uses: actions/upload-artifact@v4
+        with:
+          name: net-spider-${{ env.TARGET }}-uf2
+          path: target/${{ env.TARGET }}/release/net-spider.uf2
           if-no-files-found: error
