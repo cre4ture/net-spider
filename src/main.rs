@@ -26,6 +26,7 @@ const LOCAL_SLOT_COUNT: usize = 8;
 const MAX_EXPANDERS: usize = 8;
 const EXPANDER_SLOT_COUNT: usize = 16;
 const TOTAL_SLOT_CAPACITY: usize = LOCAL_SLOT_COUNT + MAX_EXPANDERS * EXPANDER_SLOT_COUNT;
+const MCP23017_BASE_ADDRESS: u8 = 0x20;
 const CONTROL_PINS: [u8; LOCAL_SLOT_COUNT] = [2, 3, 4, 5, 6, 7, 8, 9];
 const MCP23017_I2C_FREQ_HZ: u32 = 100_000;
 const MCP23017_SDA_PIN: u8 = 26;
@@ -67,6 +68,11 @@ enum ParsedCommand {
     Status,
     SetOne { slot: usize, state: DriveState },
     SetAll(DriveState),
+}
+
+const fn expander_slot_range(index: usize) -> (usize, usize) {
+    let start = LOCAL_SLOT_COUNT + index * EXPANDER_SLOT_COUNT + 1;
+    (start, start + EXPANDER_SLOT_COUNT - 1)
 }
 
 struct LocalPins {
@@ -127,34 +133,31 @@ impl LocalPins {
 
 struct ExpanderBank<I2C> {
     i2c: I2C,
-    devices: [Mcp23017; MAX_EXPANDERS],
-    count: usize,
+    devices: [Option<Mcp23017>; MAX_EXPANDERS],
 }
 
 impl<I2C> ExpanderBank<I2C> {
     fn new(i2c: I2C) -> Self {
         Self {
             i2c,
-            devices: [Mcp23017::placeholder(); MAX_EXPANDERS],
-            count: 0,
+            devices: [None; MAX_EXPANDERS],
         }
     }
 
-    fn push(&mut self, device: Mcp23017) {
-        self.devices[self.count] = device;
-        self.count += 1;
+    fn insert(&mut self, device: Mcp23017) {
+        let index = usize::from(device.address() - MCP23017_BASE_ADDRESS);
+        self.devices[index] = Some(device);
     }
 
     fn count(&self) -> usize {
-        self.count
-    }
-
-    fn total_slots(&self) -> usize {
-        self.count * EXPANDER_SLOT_COUNT
+        self.devices
+            .iter()
+            .filter(|device| device.is_some())
+            .count()
     }
 
     fn device(&self, index: usize) -> Option<&Mcp23017> {
-        (index < self.count).then_some(&self.devices[index])
+        self.devices.get(index)?.as_ref()
     }
 }
 
@@ -166,18 +169,18 @@ where
         let device_index = slot / EXPANDER_SLOT_COUNT;
         let pin_index = slot % EXPANDER_SLOT_COUNT;
 
-        if device_index >= self.count {
-            return Err("target pin belongs to an undetected mcp23017");
-        }
+        let Some(device) = self.devices.get_mut(device_index).and_then(Option::as_mut) else {
+            return Err("target pin belongs to an unavailable mcp23017 address block");
+        };
 
-        self.devices[device_index]
+        device
             .set_pin_state(&mut self.i2c, pin_index, state)
             .map_err(|_| "mcp23017 i2c write failed")
     }
 
     fn set_all(&mut self, state: DriveState) -> Result<(), &'static str> {
-        for device_index in 0..self.count {
-            self.devices[device_index]
+        for device in self.devices.iter_mut().flatten() {
+            device
                 .set_all_state(&mut self.i2c, state)
                 .map_err(|_| "mcp23017 i2c write failed")?;
         }
@@ -231,14 +234,6 @@ where
         }
 
         Ok(())
-    }
-
-    fn total_slots_available(&self) -> usize {
-        LOCAL_SLOT_COUNT
-            + match &self.expander {
-                ExpanderState::Ready(expander) => expander.total_slots(),
-                ExpanderState::NotFound | ExpanderState::Fault => 0,
-            }
     }
 }
 
@@ -349,10 +344,10 @@ where
 {
     let mut expander = ExpanderBank::new(i2c);
 
-    for address in 0x20..=0x27 {
+    for address in MCP23017_BASE_ADDRESS..=(MCP23017_BASE_ADDRESS + MAX_EXPANDERS as u8 - 1) {
         match Mcp23017::probe(&mut expander.i2c, address) {
             Ok(true) => match Mcp23017::new(&mut expander.i2c, address) {
-                Ok(device) => expander.push(device),
+                Ok(device) => expander.insert(device),
                 Err(_) => return ExpanderState::Fault,
             },
             Ok(false) => {}
@@ -464,19 +459,19 @@ LOCAL P1=GP2 P2=GP3 P3=GP4 P4=GP5 P5=GP6 P6=GP7 P7=GP8 P8=GP9\r\n",
         ExpanderState::Ready(expander) => {
             let _ = write!(
                 uart,
-                "MCP23017 count={} on GP{}(SDA)/GP{}(SCL): P9..P{} available\r\n",
+                "MCP23017 count={} on GP{}(SDA)/GP{}(SCL): fixed mapping P9..P136\r\n",
                 expander.count(),
                 MCP23017_SDA_PIN,
                 MCP23017_SCL_PIN,
-                controlled_pins.total_slots_available(),
             );
 
             let _ = write!(uart, "EXPANDERS ");
-            for index in 0..expander.count() {
+            for index in 0..MAX_EXPANDERS {
                 if let Some(device) = expander.device(index) {
-                    let start = LOCAL_SLOT_COUNT + index * EXPANDER_SLOT_COUNT + 1;
-                    let end = start + EXPANDER_SLOT_COUNT - 1;
-                    let separator = if index + 1 == expander.count() {
+                    let (start, end) = expander_slot_range(index);
+                    let separator = if index + 1 == MAX_EXPANDERS
+                        || (index + 1..MAX_EXPANDERS).all(|next| expander.device(next).is_none())
+                    {
                         "\r\n"
                     } else {
                         " "
@@ -520,19 +515,16 @@ fn write_help<I2C, P>(
     P: rp2040_hal::uart::ValidUartPinout<pac::UART1>,
 {
     match &controlled_pins.expander {
-        ExpanderState::Ready(expander) => {
+        ExpanderState::Ready(_) => {
             let _ = write!(
                 uart,
-                "OK commands: HELP, STATUS, P1..P{} HIGH|LOW|HI-Z, X1..X16/GPA0..GPB7=E1 aliases, E1X1..E{}X16, E1GPA0..E{}GPB7, ALL HIGH|LOW|HI-Z; short H|L|Z\r\n",
-                controlled_pins.total_slots_available(),
-                expander.count(),
-                expander.count(),
+                "OK commands: HELP, STATUS, P1..P136 HIGH|LOW|HI-Z, E1X1..E8X16, E1GPA0..E8GPB7, ALL HIGH|LOW|HI-Z; STATUS lists detected address blocks\r\n"
             );
         }
         ExpanderState::NotFound | ExpanderState::Fault => {
             let _ = write!(
                 uart,
-                "OK commands: HELP, STATUS, P1..P8 HIGH|LOW|HI-Z, ALL HIGH|LOW|HI-Z; add up to 8 MCP23017 on GP26/GP27 for more pins\r\n"
+                "OK commands: HELP, STATUS, P1..P8 HIGH|LOW|HI-Z, P9..P136 reserved for MCP23017 address blocks 0x20..0x27, ALL HIGH|LOW|HI-Z\r\n"
             );
         }
     }
@@ -565,13 +557,12 @@ fn write_status<I2C, P>(
                 MCP23017_SCL_PIN,
             );
 
-            for device_index in 0..expander.count() {
+            for device_index in 0..MAX_EXPANDERS {
                 let Some(device) = expander.device(device_index) else {
                     continue;
                 };
 
-                let start = LOCAL_SLOT_COUNT + device_index * EXPANDER_SLOT_COUNT + 1;
-                let end = start + EXPANDER_SLOT_COUNT - 1;
+                let (start, end) = expander_slot_range(device_index);
                 let _ = write!(
                     uart,
                     "STATUS E{} addr=0x{:02X} slots=P{}..P{}\r\n",
@@ -714,23 +705,7 @@ fn parse_slot(token: &str) -> Result<usize, &'static str> {
         return Ok(slot);
     }
 
-    if let Some(slot) = parse_prefixed_1_based(token, "X", EXPANDER_SLOT_COUNT) {
-        return Ok(LOCAL_SLOT_COUNT + slot - 1);
-    }
-
-    if let Some(slot) = parse_prefixed_1_based(token, "M", EXPANDER_SLOT_COUNT) {
-        return Ok(LOCAL_SLOT_COUNT + slot - 1);
-    }
-
-    if let Some(bit) = parse_prefixed_0_based(token, "GPA", 8) {
-        return Ok(LOCAL_SLOT_COUNT + bit);
-    }
-
-    if let Some(bit) = parse_prefixed_0_based(token, "GPB", 8) {
-        return Ok(LOCAL_SLOT_COUNT + 8 + bit);
-    }
-
-    Err("unknown pin, use P1..P136, GP2..GP9, X1..X16, GPA0..GPB7, or E1X1..E8GPB7")
+    Err("unknown pin, use P1..P136, GP2..GP9, E1X1..E8X16, or E1GPA0..E8GPB7")
 }
 
 fn parse_expander_scoped_slot(token: &str) -> Option<usize> {
@@ -754,10 +729,6 @@ fn parse_expander_scoped_slot(token: &str) -> Option<usize> {
     let base = LOCAL_SLOT_COUNT + (expander_index - 1) * EXPANDER_SLOT_COUNT;
 
     if let Some(slot) = parse_prefixed_1_based(pin_text, "X", EXPANDER_SLOT_COUNT) {
-        return Some(base + slot - 1);
-    }
-
-    if let Some(slot) = parse_prefixed_1_based(pin_text, "M", EXPANDER_SLOT_COUNT) {
         return Some(base + slot - 1);
     }
 

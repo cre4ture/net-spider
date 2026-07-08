@@ -34,15 +34,31 @@ Every MCP23017 on the bus needs a unique address via `A0`, `A1`, and `A2`.
 The firmware scans `0x20..0x27` at boot and enables every responding device it
 finds.
 
+### Fixed address mapping
+
+Expander numbering is fixed by MCP23017 address and never shifts when devices
+are added or removed:
+
+- `0x20` -> `E1` -> `P9`..`P24`
+- `0x21` -> `E2` -> `P25`..`P40`
+- `0x22` -> `E3` -> `P41`..`P56`
+- `0x23` -> `E4` -> `P57`..`P72`
+- `0x24` -> `E5` -> `P73`..`P88`
+- `0x25` -> `E6` -> `P89`..`P104`
+- `0x26` -> `E7` -> `P105`..`P120`
+- `0x27` -> `E8` -> `P121`..`P136`
+
+If only some addresses are populated, their port ranges stay reserved and are
+not renumbered. Example: if only `0x22` and `0x27` are present, then only
+`P41`..`P56` and `P121`..`P136` exist; `P9`..`P40` and `P57`..`P120` stay
+unused. Startup output and `STATUS` skip missing ranges instead of compacting
+them.
+
 The supported command mapping is:
 
-- `P9`..`P24` -> first MCP23017 (`E1`)
-- `P25`..`P40` -> second MCP23017 (`E2`)
-- ...
-- `P121`..`P136` -> eighth MCP23017 (`E8`)
+- `P9`..`P136` -> fixed global port numbers by address block
 - `E1X1`..`E8X16` -> explicit per-expander pin aliases
 - `E1GPA0`..`E8GPB7` -> explicit bank/bit aliases
-- `X1`..`X16`, `M1`..`M16`, `GPA0`..`GPB7` -> legacy aliases for the first expander only
 
 `HI-Z` maps to input mode without pull-up on the MCP23017, so the line is no
 longer driven by the expander.
@@ -72,9 +88,9 @@ P5 LOW
 P8 HI-Z
 P12 HIGH
 P25 LOW
-X3 LOW
+E1X3 LOW
 E2X3 LOW
-GPA7 HIGH
+E1GPA7 HIGH
 E2GPB0 HI-Z
 SET P4 H
 ALL Z
@@ -86,7 +102,6 @@ these aliases:
 - Pin selectors:
   - Local: `P1`..`P8`, `1`..`8`, `GP2`..`GP9`
   - Global expander slots: `P9`..`P136`, `9`..`136`
-  - First expander aliases: `X1`..`X16`, `M1`..`M16`, `GPA0`..`GPA7`, `GPB0`..`GPB7`
   - Explicit expander aliases: `E1X1`..`E8X16`, `E1GPA0`..`E8GPA7`, `E1GPB0`..`E8GPB7`
 - High: `H`, `ON`, `1`
 - Low: `L`, `OFF`, `0`
