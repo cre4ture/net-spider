@@ -13,14 +13,6 @@ pub struct Mcp23017 {
 }
 
 impl Mcp23017 {
-    pub const fn placeholder() -> Self {
-        Self {
-            address: 0,
-            states: [DriveState::HiZ; EXPANDER_SLOT_COUNT],
-            output_latch: 0,
-        }
-    }
-
     pub const fn address(&self) -> u8 {
         self.address
     }
