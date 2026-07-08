@@ -1,5 +1,5 @@
-#![no_std]
-#![no_main]
+#![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(test), no_main)]
 
 mod ch9120;
 mod mcp23017;
@@ -9,10 +9,11 @@ use core::fmt::Write;
 use ch9120::{Ch9120, NetworkConfig, NetworkMode};
 use cortex_m::delay::Delay;
 use mcp23017::Mcp23017;
+#[cfg(not(test))]
 use panic_halt as _;
 use rp2040_hal::Clock;
 use rp2040_hal::clocks::init_clocks_and_plls;
-use rp2040_hal::fugit::RateExtU32;
+use rp2040_hal::fugit::{ExtU32, RateExtU32};
 use rp2040_hal::gpio::Pins;
 use rp2040_hal::i2c::I2C;
 use rp2040_hal::pac;
@@ -31,6 +32,7 @@ const CONTROL_PINS: [u8; LOCAL_SLOT_COUNT] = [2, 3, 4, 5, 6, 7, 8, 9];
 const MCP23017_I2C_FREQ_HZ: u32 = 100_000;
 const MCP23017_SDA_PIN: u8 = 26;
 const MCP23017_SCL_PIN: u8 = 27;
+const WATCHDOG_TIMEOUT_MS: u32 = 8_000;
 const NETWORK_CONFIG: NetworkConfig = NetworkConfig {
     mode: NetworkMode::TcpServer,
     local_ip: [192, 168, 1, 200],
@@ -66,6 +68,7 @@ impl DriveState {
 enum ParsedCommand {
     Help,
     Status,
+    Scan,
     SetOne { slot: usize, state: DriveState },
     SetAll(DriveState),
 }
@@ -108,6 +111,11 @@ impl LocalPins {
             .fold(0u32, |mask, pin| mask | (1u32 << pin))
     }
 
+    // Real SIO register access is skipped under `cfg(test)`: host unit tests
+    // run on x86_64, where `pac::SIO::ptr()` is not a valid address and
+    // dereferencing it would crash the test binary instead of exercising
+    // firmware logic.
+    #[cfg(not(test))]
     fn apply_mask_state(&self, mask: u32, state: DriveState) {
         let sio = unsafe { &*pac::SIO::ptr() };
 
@@ -126,20 +134,29 @@ impl LocalPins {
         }
     }
 
+    #[cfg(test)]
+    fn apply_mask_state(&self, _mask: u32, _state: DriveState) {}
+
     fn apply_state(&self, pin: u8, state: DriveState) {
         self.apply_mask_state(1u32 << pin, state);
     }
 }
 
-struct ExpanderBank<I2C> {
-    i2c: I2C,
+// `ExpanderBank`/`ExpanderState` intentionally never own the I2C bus handle.
+// Detection used to run unconditionally at boot, before the UART/TCP command
+// loop started; on a board without a populated (or correctly wired) MCP23017
+// bus, `rp2040-hal`'s blocking I2C driver has no timeout and can spin forever
+// inside `detect_expanders`, which permanently starved the loop that answers
+// commands over the CH9120's TCP port. Detection is now opt-in via the SCAN
+// command (see `CommandPins::scan`), so boot can never block on I2C, and the
+// bus handle lives on `CommandPins` so it can be retried after a failed scan.
+struct ExpanderBank {
     devices: [Option<Mcp23017>; MAX_EXPANDERS],
 }
 
-impl<I2C> ExpanderBank<I2C> {
-    fn new(i2c: I2C) -> Self {
+impl ExpanderBank {
+    fn new() -> Self {
         Self {
-            i2c,
             devices: [None; MAX_EXPANDERS],
         }
     }
@@ -159,13 +176,16 @@ impl<I2C> ExpanderBank<I2C> {
     fn device(&self, index: usize) -> Option<&Mcp23017> {
         self.devices.get(index)?.as_ref()
     }
-}
 
-impl<I2C> ExpanderBank<I2C>
-where
-    I2C: embedded_hal::i2c::I2c,
-{
-    fn set(&mut self, slot: usize, state: DriveState) -> Result<(), &'static str> {
+    fn set<I2C>(
+        &mut self,
+        i2c: &mut I2C,
+        slot: usize,
+        state: DriveState,
+    ) -> Result<(), &'static str>
+    where
+        I2C: embedded_hal::i2c::I2c,
+    {
         let device_index = slot / EXPANDER_SLOT_COUNT;
         let pin_index = slot % EXPANDER_SLOT_COUNT;
 
@@ -174,14 +194,17 @@ where
         };
 
         device
-            .set_pin_state(&mut self.i2c, pin_index, state)
+            .set_pin_state(i2c, pin_index, state)
             .map_err(|_| "mcp23017 i2c write failed")
     }
 
-    fn set_all(&mut self, state: DriveState) -> Result<(), &'static str> {
+    fn set_all<I2C>(&mut self, i2c: &mut I2C, state: DriveState) -> Result<(), &'static str>
+    where
+        I2C: embedded_hal::i2c::I2c,
+    {
         for device in self.devices.iter_mut().flatten() {
             device
-                .set_all_state(&mut self.i2c, state)
+                .set_all_state(i2c, state)
                 .map_err(|_| "mcp23017 i2c write failed")?;
         }
 
@@ -189,26 +212,60 @@ where
     }
 }
 
-enum ExpanderState<I2C> {
-    Ready(ExpanderBank<I2C>),
+enum ExpanderState {
+    Uninitialized,
+    Ready(ExpanderBank),
     NotFound,
     Fault,
 }
 
+fn detect_expanders<I2C>(i2c: &mut I2C) -> ExpanderState
+where
+    I2C: embedded_hal::i2c::I2c,
+{
+    let mut expander = ExpanderBank::new();
+
+    for address in MCP23017_BASE_ADDRESS..=(MCP23017_BASE_ADDRESS + MAX_EXPANDERS as u8 - 1) {
+        match Mcp23017::probe(i2c, address) {
+            Ok(true) => match Mcp23017::new(i2c, address) {
+                Ok(device) => expander.insert(device),
+                Err(_) => return ExpanderState::Fault,
+            },
+            Ok(false) => {}
+            Err(_) => return ExpanderState::Fault,
+        }
+    }
+
+    if expander.count() == 0 {
+        ExpanderState::NotFound
+    } else {
+        ExpanderState::Ready(expander)
+    }
+}
+
 struct CommandPins<I2C> {
     local: LocalPins,
-    expander: ExpanderState<I2C>,
+    i2c: I2C,
+    expander: ExpanderState,
 }
 
 impl<I2C> CommandPins<I2C>
 where
     I2C: embedded_hal::i2c::I2c,
 {
-    fn new(pin_numbers: [u8; LOCAL_SLOT_COUNT], expander: ExpanderState<I2C>) -> Self {
+    fn new(pin_numbers: [u8; LOCAL_SLOT_COUNT], i2c: I2C) -> Self {
         Self {
             local: LocalPins::new(pin_numbers),
-            expander,
+            i2c,
+            expander: ExpanderState::Uninitialized,
         }
+    }
+
+    /// Runs (or re-runs) MCP23017 detection. The only place that touches the
+    /// I2C bus outside of an explicit expander pin write — never called
+    /// implicitly at boot or from `set`/`set_all`.
+    fn scan(&mut self) {
+        self.expander = detect_expanders(&mut self.i2c);
     }
 
     fn set(&mut self, slot: usize, state: DriveState) -> Result<(), &'static str> {
@@ -220,7 +277,8 @@ where
         let expander_slot = slot - LOCAL_SLOT_COUNT;
 
         match &mut self.expander {
-            ExpanderState::Ready(expander) => expander.set(expander_slot, state),
+            ExpanderState::Ready(expander) => expander.set(&mut self.i2c, expander_slot, state),
+            ExpanderState::Uninitialized => Err("mcp23017 not scanned yet; send SCAN"),
             ExpanderState::NotFound => Err("mcp23017 not detected on GP26/GP27"),
             ExpanderState::Fault => Err("mcp23017 init failed; recheck wiring and power"),
         }
@@ -230,13 +288,14 @@ where
         self.local.set_all(state);
 
         if let ExpanderState::Ready(expander) = &mut self.expander {
-            expander.set_all(state)?;
+            expander.set_all(&mut self.i2c, state)?;
         }
 
         Ok(())
     }
 }
 
+#[cfg(not(test))]
 #[rp2040_hal::entry]
 fn main() -> ! {
     let mut pac = pac::Peripherals::take().expect("RP2040 peripherals can only be taken once");
@@ -308,14 +367,24 @@ fn main() -> ! {
         NETWORK_CONFIG,
     );
 
-    let expander = detect_expanders(i2c);
-    let mut controlled_pins = CommandPins::new(CONTROL_PINS, expander);
+    // MCP23017 detection is intentionally NOT run here. It used to block boot
+    // (see the comment on `ExpanderBank`); it's now opt-in via the SCAN
+    // command so a missing/misbehaving I2C bus can never stop the board from
+    // answering on the CH9120's TCP port.
+    let mut controlled_pins = CommandPins::new(CONTROL_PINS, i2c);
     let mut line_buffer = [0u8; COMMAND_BUFFER_LEN];
     let mut line_len = 0usize;
 
     write_startup_banner(&controlled_pins, &mut uart);
 
+    // Backstop for the one place that can still block on I2C at runtime: the
+    // SCAN command and expander pin writes. If either wedges on a bad bus,
+    // the watchdog resets the board instead of leaving it silently hung.
+    watchdog.start(WATCHDOG_TIMEOUT_MS.millis());
+
     loop {
+        watchdog.feed();
+
         let mut rx = [0u8; 32];
 
         match uart.read_raw(&mut rx) {
@@ -335,30 +404,6 @@ fn main() -> ! {
                 let _ = write!(uart, "ERR uart read failure\r\n");
             }
         }
-    }
-}
-
-fn detect_expanders<I2C>(i2c: I2C) -> ExpanderState<I2C>
-where
-    I2C: embedded_hal::i2c::I2c,
-{
-    let mut expander = ExpanderBank::new(i2c);
-
-    for address in MCP23017_BASE_ADDRESS..=(MCP23017_BASE_ADDRESS + MAX_EXPANDERS as u8 - 1) {
-        match Mcp23017::probe(&mut expander.i2c, address) {
-            Ok(true) => match Mcp23017::new(&mut expander.i2c, address) {
-                Ok(device) => expander.insert(device),
-                Err(_) => return ExpanderState::Fault,
-            },
-            Ok(false) => {}
-            Err(_) => return ExpanderState::Fault,
-        }
-    }
-
-    if expander.count() == 0 {
-        ExpanderState::NotFound
-    } else {
-        ExpanderState::Ready(expander)
     }
 }
 
@@ -413,6 +458,10 @@ fn process_line<I2C, P>(
     match parse_command(line) {
         Ok(ParsedCommand::Help) => write_help(controlled_pins, uart),
         Ok(ParsedCommand::Status) => write_status(controlled_pins, uart),
+        Ok(ParsedCommand::Scan) => {
+            controlled_pins.scan();
+            write_scan_result(controlled_pins, uart);
+        }
         Ok(ParsedCommand::SetOne { slot, state }) => match controlled_pins.set(slot, state) {
             Ok(()) => {
                 let _ = write!(uart, "OK ");
@@ -456,6 +505,13 @@ LOCAL P1=GP2 P2=GP3 P3=GP4 P4=GP5 P5=GP6 P6=GP7 P7=GP8 P8=GP9\r\n",
     );
 
     match &controlled_pins.expander {
+        ExpanderState::Uninitialized => {
+            let _ = write!(
+                uart,
+                "MCP23017 not scanned yet on GP{}(SDA)/GP{}(SCL); send SCAN to detect, only P1..P8 available until then\r\n",
+                MCP23017_SDA_PIN, MCP23017_SCL_PIN,
+            );
+        }
         ExpanderState::Ready(expander) => {
             let _ = write!(
                 uart,
@@ -504,7 +560,10 @@ LOCAL P1=GP2 P2=GP3 P3=GP4 P4=GP5 P5=GP6 P6=GP7 P7=GP8 P8=GP9\r\n",
         }
     }
 
-    let _ = write!(uart, "Try HELP, STATUS, P1 HIGH, E2X3 LOW, or ALL HI-Z\r\n");
+    let _ = write!(
+        uart,
+        "Try HELP, STATUS, SCAN, P1 HIGH, E2X3 LOW, or ALL HI-Z\r\n"
+    );
 }
 
 fn write_help<I2C, P>(
@@ -518,14 +577,40 @@ fn write_help<I2C, P>(
         ExpanderState::Ready(_) => {
             let _ = write!(
                 uart,
-                "OK commands: HELP, STATUS, P1..P136 HIGH|LOW|HI-Z, E1X1..E8X16, E1GPA0..E8GPB7, ALL HIGH|LOW|HI-Z; STATUS lists detected address blocks\r\n"
+                "OK commands: HELP, STATUS, SCAN, P1..P136 HIGH|LOW|HI-Z, E1X1..E8X16, E1GPA0..E8GPB7, ALL HIGH|LOW|HI-Z; STATUS lists detected address blocks\r\n"
             );
         }
-        ExpanderState::NotFound | ExpanderState::Fault => {
+        ExpanderState::Uninitialized | ExpanderState::NotFound | ExpanderState::Fault => {
             let _ = write!(
                 uart,
-                "OK commands: HELP, STATUS, P1..P8 HIGH|LOW|HI-Z, P9..P136 reserved for MCP23017 address blocks 0x20..0x27, ALL HIGH|LOW|HI-Z\r\n"
+                "OK commands: HELP, STATUS, SCAN, P1..P8 HIGH|LOW|HI-Z, P9..P136 reserved for MCP23017 address blocks 0x20..0x27 (run SCAN to detect), ALL HIGH|LOW|HI-Z\r\n"
             );
+        }
+    }
+}
+
+fn write_scan_result<I2C, P>(
+    controlled_pins: &CommandPins<I2C>,
+    uart: &mut UartPeripheral<rp2040_hal::uart::Enabled, pac::UART1, P>,
+) where
+    I2C: embedded_hal::i2c::I2c,
+    P: rp2040_hal::uart::ValidUartPinout<pac::UART1>,
+{
+    match &controlled_pins.expander {
+        ExpanderState::Ready(expander) => {
+            let _ = write!(uart, "OK SCAN count={}\r\n", expander.count());
+        }
+        ExpanderState::NotFound => {
+            let _ = write!(uart, "OK SCAN count=0\r\n");
+        }
+        ExpanderState::Fault => {
+            let _ = write!(
+                uart,
+                "ERR mcp23017 scan failed; recheck wiring and power\r\n"
+            );
+        }
+        ExpanderState::Uninitialized => {
+            let _ = write!(uart, "ERR scan did not complete\r\n");
         }
     }
 }
@@ -599,6 +684,9 @@ fn write_status<I2C, P>(
                 }
             }
         }
+        ExpanderState::Uninitialized => {
+            let _ = write!(uart, "STATUS MCP23017=not-scanned; send SCAN\r\n");
+        }
         ExpanderState::NotFound => {
             let _ = write!(
                 uart,
@@ -651,6 +739,10 @@ fn parse_command(line: &str) -> Result<ParsedCommand, &'static str> {
 
     if first.eq_ignore_ascii_case("STATUS") && parts.next().is_none() {
         return Ok(ParsedCommand::Status);
+    }
+
+    if first.eq_ignore_ascii_case("SCAN") && parts.next().is_none() {
+        return Ok(ParsedCommand::Scan);
     }
 
     if first.eq_ignore_ascii_case("ALL") {
@@ -787,4 +879,134 @@ fn parse_state(token: &str) -> Result<DriveState, &'static str> {
     }
 
     Err("unknown state, use HIGH, LOW, or HI-Z")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use embedded_hal::i2c::{
+        Error as _, ErrorKind, ErrorType, I2c, NoAcknowledgeSource, Operation, SevenBitAddress,
+    };
+
+    // Regression coverage for the boot hang fixed by making MCP23017
+    // detection opt-in (see the comment on `ExpanderBank`): before that fix,
+    // `detect_expanders` ran unconditionally at boot using a blocking I2C
+    // driver with no timeout, so a bad/absent bus could permanently starve
+    // the UART/TCP command loop. These tests assert the bus is only ever
+    // touched by an explicit `scan()`, never by construction or by commands
+    // that don't need it.
+
+    #[derive(Debug)]
+    struct FakeI2cError;
+
+    impl embedded_hal::i2c::Error for FakeI2cError {
+        fn kind(&self) -> ErrorKind {
+            ErrorKind::NoAcknowledge(NoAcknowledgeSource::Address)
+        }
+    }
+
+    /// Minimal fake I2C bus: NACKs every address except (optionally) one
+    /// "present" device address, and counts how many transactions ran.
+    struct FakeI2c {
+        present_address: Option<u8>,
+        calls: usize,
+    }
+
+    impl FakeI2c {
+        fn no_devices() -> Self {
+            Self {
+                present_address: None,
+                calls: 0,
+            }
+        }
+
+        fn with_device_at(address: u8) -> Self {
+            Self {
+                present_address: Some(address),
+                calls: 0,
+            }
+        }
+    }
+
+    impl ErrorType for FakeI2c {
+        type Error = FakeI2cError;
+    }
+
+    impl I2c<SevenBitAddress> for FakeI2c {
+        fn transaction(
+            &mut self,
+            address: u8,
+            operations: &mut [Operation<'_>],
+        ) -> Result<(), Self::Error> {
+            self.calls += 1;
+
+            if self.present_address != Some(address) {
+                return Err(FakeI2cError);
+            }
+
+            for operation in operations {
+                if let Operation::Read(buffer) = operation {
+                    buffer.fill(0);
+                }
+            }
+
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn boot_never_touches_i2c_bus() {
+        let pins = CommandPins::new(CONTROL_PINS, FakeI2c::no_devices());
+
+        assert_eq!(pins.i2c.calls, 0, "constructing CommandPins must not scan");
+        assert!(matches!(pins.expander, ExpanderState::Uninitialized));
+    }
+
+    #[test]
+    fn expander_slot_before_scan_errors_without_touching_i2c() {
+        let mut pins = CommandPins::new(CONTROL_PINS, FakeI2c::no_devices());
+
+        let result = pins.set(LOCAL_SLOT_COUNT, DriveState::High);
+
+        assert!(result.is_err());
+        assert_eq!(pins.i2c.calls, 0);
+    }
+
+    #[test]
+    fn local_pin_commands_never_touch_i2c_even_after_a_failed_scan() {
+        let mut pins = CommandPins::new(CONTROL_PINS, FakeI2c::no_devices());
+
+        pins.scan();
+        assert!(matches!(pins.expander, ExpanderState::NotFound));
+        let calls_after_scan = pins.i2c.calls;
+        assert!(calls_after_scan > 0, "scan should have probed the bus");
+
+        assert!(pins.set(0, DriveState::High).is_ok());
+        assert_eq!(
+            pins.i2c.calls, calls_after_scan,
+            "local pin writes must never touch the I2C bus"
+        );
+    }
+
+    #[test]
+    fn scan_detects_device_and_allows_expander_writes() {
+        let mut pins =
+            CommandPins::new(CONTROL_PINS, FakeI2c::with_device_at(MCP23017_BASE_ADDRESS));
+
+        pins.scan();
+
+        match &pins.expander {
+            ExpanderState::Ready(bank) => assert_eq!(bank.count(), 1),
+            _ => panic!("expected a detected expander, got a different state"),
+        }
+
+        assert!(pins.set(LOCAL_SLOT_COUNT, DriveState::High).is_ok());
+    }
+
+    #[test]
+    fn parses_scan_command_case_insensitively() {
+        assert!(matches!(parse_command("scan"), Ok(ParsedCommand::Scan)));
+        assert!(matches!(parse_command("SCAN"), Ok(ParsedCommand::Scan)));
+        assert!(parse_command("SCAN extra").is_err());
+    }
 }

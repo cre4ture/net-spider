@@ -31,8 +31,13 @@ same bus and exposes their GPIOs as additional tri-state channels.
 - `GND` -> all MCP23017 `GND`
 
 Every MCP23017 on the bus needs a unique address via `A0`, `A1`, and `A2`.
-The firmware scans `0x20..0x27` at boot and enables every responding device it
-finds.
+
+Detection is on-demand, not automatic at boot: send the `SCAN` command to
+probe `0x20..0x27` and enable every responding device. Boot never touches the
+I2C bus, so a missing or misbehaving expander can't delay or block the board
+from answering commands over the network. Until `SCAN` has been run, `P9` and
+above report an error instead of hanging; `SCAN` can be re-run at any time
+(e.g. after wiring up an expander) to pick up newly present devices.
 
 ### Fixed address mapping
 
@@ -83,6 +88,7 @@ The parser accepts either direct commands or a `SET` prefix:
 ```text
 HELP
 STATUS
+SCAN
 P1 HIGH
 P5 LOW
 P8 HI-Z
@@ -112,6 +118,15 @@ these aliases:
 ```bash
 rustup target add thumbv6m-none-eabi
 cargo build --release
+```
+
+## Test
+
+Command parsing and expander-detection logic have host-side unit tests
+(hardware-touching code is `cfg`'d out under `test`):
+
+```bash
+cargo test --target x86_64-unknown-linux-gnu
 ```
 
 To flash over USB boot mode, `elf2uf2-rs` is convenient:
