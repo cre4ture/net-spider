@@ -2,16 +2,19 @@
 #![no_main]
 
 mod ch9120;
+mod mcp23017;
 
 use core::fmt::Write;
 
 use ch9120::{Ch9120, NetworkConfig, NetworkMode};
 use cortex_m::delay::Delay;
+use mcp23017::Mcp23017;
 use panic_halt as _;
 use rp2040_hal::Clock;
 use rp2040_hal::clocks::init_clocks_and_plls;
 use rp2040_hal::fugit::RateExtU32;
 use rp2040_hal::gpio::Pins;
+use rp2040_hal::i2c::I2C;
 use rp2040_hal::pac;
 use rp2040_hal::sio::Sio;
 use rp2040_hal::uart::{DataBits, StopBits, UartConfig, UartPeripheral};
@@ -19,7 +22,14 @@ use rp2040_hal::watchdog::Watchdog;
 
 const XTAL_FREQ_HZ: u32 = 12_000_000;
 const COMMAND_BUFFER_LEN: usize = 64;
-const CONTROL_PINS: [u8; 8] = [2, 3, 4, 5, 6, 7, 8, 9];
+const LOCAL_SLOT_COUNT: usize = 8;
+const MAX_EXPANDERS: usize = 8;
+const EXPANDER_SLOT_COUNT: usize = 16;
+const TOTAL_SLOT_CAPACITY: usize = LOCAL_SLOT_COUNT + MAX_EXPANDERS * EXPANDER_SLOT_COUNT;
+const CONTROL_PINS: [u8; LOCAL_SLOT_COUNT] = [2, 3, 4, 5, 6, 7, 8, 9];
+const MCP23017_I2C_FREQ_HZ: u32 = 100_000;
+const MCP23017_SDA_PIN: u8 = 26;
+const MCP23017_SCL_PIN: u8 = 27;
 const NETWORK_CONFIG: NetworkConfig = NetworkConfig {
     mode: NetworkMode::TcpServer,
     local_ip: [192, 168, 1, 200],
@@ -59,16 +69,16 @@ enum ParsedCommand {
     SetAll(DriveState),
 }
 
-struct CommandPins {
-    pin_numbers: [u8; 8],
-    states: [DriveState; 8],
+struct LocalPins {
+    pin_numbers: [u8; LOCAL_SLOT_COUNT],
+    states: [DriveState; LOCAL_SLOT_COUNT],
 }
 
-impl CommandPins {
-    fn new(pin_numbers: [u8; 8]) -> Self {
+impl LocalPins {
+    fn new(pin_numbers: [u8; LOCAL_SLOT_COUNT]) -> Self {
         let controller = Self {
             pin_numbers,
-            states: [DriveState::HiZ; 8],
+            states: [DriveState::HiZ; LOCAL_SLOT_COUNT],
         };
 
         controller.apply_mask_state(controller.mask(), DriveState::HiZ);
@@ -115,6 +125,122 @@ impl CommandPins {
     }
 }
 
+struct ExpanderBank<I2C> {
+    i2c: I2C,
+    devices: [Mcp23017; MAX_EXPANDERS],
+    count: usize,
+}
+
+impl<I2C> ExpanderBank<I2C> {
+    fn new(i2c: I2C) -> Self {
+        Self {
+            i2c,
+            devices: [Mcp23017::placeholder(); MAX_EXPANDERS],
+            count: 0,
+        }
+    }
+
+    fn push(&mut self, device: Mcp23017) {
+        self.devices[self.count] = device;
+        self.count += 1;
+    }
+
+    fn count(&self) -> usize {
+        self.count
+    }
+
+    fn total_slots(&self) -> usize {
+        self.count * EXPANDER_SLOT_COUNT
+    }
+
+    fn device(&self, index: usize) -> Option<&Mcp23017> {
+        (index < self.count).then_some(&self.devices[index])
+    }
+}
+
+impl<I2C> ExpanderBank<I2C>
+where
+    I2C: embedded_hal::i2c::I2c,
+{
+    fn set(&mut self, slot: usize, state: DriveState) -> Result<(), &'static str> {
+        let device_index = slot / EXPANDER_SLOT_COUNT;
+        let pin_index = slot % EXPANDER_SLOT_COUNT;
+
+        if device_index >= self.count {
+            return Err("target pin belongs to an undetected mcp23017");
+        }
+
+        self.devices[device_index]
+            .set_pin_state(&mut self.i2c, pin_index, state)
+            .map_err(|_| "mcp23017 i2c write failed")
+    }
+
+    fn set_all(&mut self, state: DriveState) -> Result<(), &'static str> {
+        for device_index in 0..self.count {
+            self.devices[device_index]
+                .set_all_state(&mut self.i2c, state)
+                .map_err(|_| "mcp23017 i2c write failed")?;
+        }
+
+        Ok(())
+    }
+}
+
+enum ExpanderState<I2C> {
+    Ready(ExpanderBank<I2C>),
+    NotFound,
+    Fault,
+}
+
+struct CommandPins<I2C> {
+    local: LocalPins,
+    expander: ExpanderState<I2C>,
+}
+
+impl<I2C> CommandPins<I2C>
+where
+    I2C: embedded_hal::i2c::I2c,
+{
+    fn new(pin_numbers: [u8; LOCAL_SLOT_COUNT], expander: ExpanderState<I2C>) -> Self {
+        Self {
+            local: LocalPins::new(pin_numbers),
+            expander,
+        }
+    }
+
+    fn set(&mut self, slot: usize, state: DriveState) -> Result<(), &'static str> {
+        if slot < LOCAL_SLOT_COUNT {
+            self.local.set(slot, state);
+            return Ok(());
+        }
+
+        let expander_slot = slot - LOCAL_SLOT_COUNT;
+
+        match &mut self.expander {
+            ExpanderState::Ready(expander) => expander.set(expander_slot, state),
+            ExpanderState::NotFound => Err("mcp23017 not detected on GP26/GP27"),
+            ExpanderState::Fault => Err("mcp23017 init failed; recheck wiring and power"),
+        }
+    }
+
+    fn set_all(&mut self, state: DriveState) -> Result<(), &'static str> {
+        if let ExpanderState::Ready(expander) = &mut self.expander {
+            expander.set_all(state)?;
+        }
+
+        self.local.set_all(state);
+        Ok(())
+    }
+
+    fn total_slots_available(&self) -> usize {
+        LOCAL_SLOT_COUNT
+            + match &self.expander {
+                ExpanderState::Ready(expander) => expander.total_slots(),
+                ExpanderState::NotFound | ExpanderState::Fault => 0,
+            }
+    }
+}
+
 #[rp2040_hal::entry]
 fn main() -> ! {
     let mut pac = pac::Peripherals::take().expect("RP2040 peripherals can only be taken once");
@@ -156,6 +282,15 @@ fn main() -> ! {
     let _gp8 = pins.gpio8.into_floating_input();
     let _gp9 = pins.gpio9.into_floating_input();
 
+    let i2c = I2C::i2c1(
+        pac.I2C1,
+        pins.gpio26.reconfigure(),
+        pins.gpio27.reconfigure(),
+        MCP23017_I2C_FREQ_HZ.Hz(),
+        &mut pac.RESETS,
+        clocks.system_clock.freq(),
+    );
+
     let config_uart = UartPeripheral::new(pac.UART1, uart_pins, &mut pac.RESETS)
         .enable(
             UartConfig::new(
@@ -178,21 +313,12 @@ fn main() -> ! {
         NETWORK_CONFIG,
     );
 
-    let mut controlled_pins = CommandPins::new(CONTROL_PINS);
+    let expander = detect_expanders(i2c);
+    let mut controlled_pins = CommandPins::new(CONTROL_PINS, expander);
     let mut line_buffer = [0u8; COMMAND_BUFFER_LEN];
     let mut line_len = 0usize;
 
-    let _ = write!(
-        uart,
-        "\r\nRP2040-ETH ready at {}.{}.{}.{}:{}\r\n\
-P1=GP2 P2=GP3 P3=GP4 P4=GP5 P5=GP6 P6=GP7 P7=GP8 P8=GP9\r\n\
-Try HELP, STATUS, P1 HIGH, or ALL HI-Z\r\n",
-        NETWORK_CONFIG.local_ip[0],
-        NETWORK_CONFIG.local_ip[1],
-        NETWORK_CONFIG.local_ip[2],
-        NETWORK_CONFIG.local_ip[3],
-        NETWORK_CONFIG.local_port,
-    );
+    write_startup_banner(&controlled_pins, &mut uart);
 
     loop {
         let mut rx = [0u8; 32];
@@ -217,13 +343,38 @@ Try HELP, STATUS, P1 HIGH, or ALL HI-Z\r\n",
     }
 }
 
-fn ingest_byte<P>(
+fn detect_expanders<I2C>(i2c: I2C) -> ExpanderState<I2C>
+where
+    I2C: embedded_hal::i2c::I2c,
+{
+    let mut expander = ExpanderBank::new(i2c);
+
+    for address in 0x20..=0x27 {
+        match Mcp23017::probe(&mut expander.i2c, address) {
+            Ok(true) => match Mcp23017::new(&mut expander.i2c, address) {
+                Ok(device) => expander.push(device),
+                Err(_) => return ExpanderState::Fault,
+            },
+            Ok(false) => {}
+            Err(_) => return ExpanderState::Fault,
+        }
+    }
+
+    if expander.count() == 0 {
+        ExpanderState::NotFound
+    } else {
+        ExpanderState::Ready(expander)
+    }
+}
+
+fn ingest_byte<I2C, P>(
     byte: u8,
     line_buffer: &mut [u8; COMMAND_BUFFER_LEN],
     line_len: &mut usize,
-    controlled_pins: &mut CommandPins,
+    controlled_pins: &mut CommandPins<I2C>,
     uart: &mut UartPeripheral<rp2040_hal::uart::Enabled, pac::UART1, P>,
 ) where
+    I2C: embedded_hal::i2c::I2c,
     P: rp2040_hal::uart::ValidUartPinout<pac::UART1>,
 {
     match byte {
@@ -251,11 +402,12 @@ fn ingest_byte<P>(
     }
 }
 
-fn process_line<P>(
+fn process_line<I2C, P>(
     raw_line: &[u8],
-    controlled_pins: &mut CommandPins,
+    controlled_pins: &mut CommandPins<I2C>,
     uart: &mut UartPeripheral<rp2040_hal::uart::Enabled, pac::UART1, P>,
 ) where
+    I2C: embedded_hal::i2c::I2c,
     P: rp2040_hal::uart::ValidUartPinout<pac::UART1>,
 {
     let Ok(line) = core::str::from_utf8(raw_line) else {
@@ -264,43 +416,238 @@ fn process_line<P>(
     };
 
     match parse_command(line) {
-        Ok(ParsedCommand::Help) => {
-            let _ = write!(
-                uart,
-                "OK commands: HELP, STATUS, P1..P8 HIGH|LOW|HI-Z, ALL HIGH|LOW|HI-Z; short H|L|Z\r\n"
-            );
-        }
-        Ok(ParsedCommand::Status) => {
-            let _ = write!(
-                uart,
-                "STATUS GP2={} GP3={} GP4={} GP5={} GP6={} GP7={} GP8={} GP9={}\r\n",
-                controlled_pins.states[0].label(),
-                controlled_pins.states[1].label(),
-                controlled_pins.states[2].label(),
-                controlled_pins.states[3].label(),
-                controlled_pins.states[4].label(),
-                controlled_pins.states[5].label(),
-                controlled_pins.states[6].label(),
-                controlled_pins.states[7].label(),
-            );
-        }
-        Ok(ParsedCommand::SetOne { slot, state }) => {
-            controlled_pins.set(slot, state);
-            let _ = write!(
-                uart,
-                "OK {} {}\r\n",
-                pin_label(slot),
-                controlled_pins.states[slot].label(),
-            );
-        }
-        Ok(ParsedCommand::SetAll(state)) => {
-            controlled_pins.set_all(state);
-            let _ = write!(uart, "OK ALL {}\r\n", state.label());
-        }
+        Ok(ParsedCommand::Help) => write_help(controlled_pins, uart),
+        Ok(ParsedCommand::Status) => write_status(controlled_pins, uart),
+        Ok(ParsedCommand::SetOne { slot, state }) => match controlled_pins.set(slot, state) {
+            Ok(()) => {
+                let _ = write!(uart, "OK ");
+                write_pin_label(slot, uart);
+                let _ = write!(uart, " {}\r\n", state.label());
+            }
+            Err(message) => {
+                let _ = write!(uart, "ERR {message}\r\n");
+            }
+        },
+        Ok(ParsedCommand::SetAll(state)) => match controlled_pins.set_all(state) {
+            Ok(()) => {
+                let _ = write!(uart, "OK ALL {}\r\n", state.label());
+            }
+            Err(message) => {
+                let _ = write!(uart, "ERR {message}\r\n");
+            }
+        },
         Err(message) => {
             let _ = write!(uart, "ERR {message}\r\n");
         }
     }
+}
+
+fn write_startup_banner<I2C, P>(
+    controlled_pins: &CommandPins<I2C>,
+    uart: &mut UartPeripheral<rp2040_hal::uart::Enabled, pac::UART1, P>,
+) where
+    I2C: embedded_hal::i2c::I2c,
+    P: rp2040_hal::uart::ValidUartPinout<pac::UART1>,
+{
+    let _ = write!(
+        uart,
+        "\r\nRP2040-ETH ready at {}.{}.{}.{}:{}\r\n\
+LOCAL P1=GP2 P2=GP3 P3=GP4 P4=GP5 P5=GP6 P6=GP7 P7=GP8 P8=GP9\r\n",
+        NETWORK_CONFIG.local_ip[0],
+        NETWORK_CONFIG.local_ip[1],
+        NETWORK_CONFIG.local_ip[2],
+        NETWORK_CONFIG.local_ip[3],
+        NETWORK_CONFIG.local_port,
+    );
+
+    match &controlled_pins.expander {
+        ExpanderState::Ready(expander) => {
+            let _ = write!(
+                uart,
+                "MCP23017 count={} on GP{}(SDA)/GP{}(SCL): P9..P{} available\r\n",
+                expander.count(),
+                MCP23017_SDA_PIN,
+                MCP23017_SCL_PIN,
+                controlled_pins.total_slots_available(),
+            );
+
+            let _ = write!(uart, "EXPANDERS ");
+            for index in 0..expander.count() {
+                if let Some(device) = expander.device(index) {
+                    let start = LOCAL_SLOT_COUNT + index * EXPANDER_SLOT_COUNT + 1;
+                    let end = start + EXPANDER_SLOT_COUNT - 1;
+                    let separator = if index + 1 == expander.count() {
+                        "\r\n"
+                    } else {
+                        " "
+                    };
+                    let _ = write!(
+                        uart,
+                        "E{}=0x{:02X}[P{}..P{}]{}",
+                        index + 1,
+                        device.address(),
+                        start,
+                        end,
+                        separator,
+                    );
+                }
+            }
+        }
+        ExpanderState::NotFound => {
+            let _ = write!(
+                uart,
+                "No MCP23017 detected on GP{}(SDA)/GP{}(SCL); only P1..P8 available\r\n",
+                MCP23017_SDA_PIN, MCP23017_SCL_PIN,
+            );
+        }
+        ExpanderState::Fault => {
+            let _ = write!(
+                uart,
+                "MCP23017 probe failed on GP{}(SDA)/GP{}(SCL); recheck wiring and supply voltage\r\n",
+                MCP23017_SDA_PIN, MCP23017_SCL_PIN,
+            );
+        }
+    }
+
+    let _ = write!(uart, "Try HELP, STATUS, P1 HIGH, E2X3 LOW, or ALL HI-Z\r\n");
+}
+
+fn write_help<I2C, P>(
+    controlled_pins: &CommandPins<I2C>,
+    uart: &mut UartPeripheral<rp2040_hal::uart::Enabled, pac::UART1, P>,
+) where
+    I2C: embedded_hal::i2c::I2c,
+    P: rp2040_hal::uart::ValidUartPinout<pac::UART1>,
+{
+    match &controlled_pins.expander {
+        ExpanderState::Ready(expander) => {
+            let _ = write!(
+                uart,
+                "OK commands: HELP, STATUS, P1..P{} HIGH|LOW|HI-Z, X1..X16/GPA0..GPB7=E1 aliases, E1X1..E{}X16, E1GPA0..E{}GPB7, ALL HIGH|LOW|HI-Z; short H|L|Z\r\n",
+                controlled_pins.total_slots_available(),
+                expander.count(),
+                expander.count(),
+            );
+        }
+        ExpanderState::NotFound | ExpanderState::Fault => {
+            let _ = write!(
+                uart,
+                "OK commands: HELP, STATUS, P1..P8 HIGH|LOW|HI-Z, ALL HIGH|LOW|HI-Z; add up to 8 MCP23017 on GP26/GP27 for more pins\r\n"
+            );
+        }
+    }
+}
+
+fn write_status<I2C, P>(
+    controlled_pins: &CommandPins<I2C>,
+    uart: &mut UartPeripheral<rp2040_hal::uart::Enabled, pac::UART1, P>,
+) where
+    I2C: embedded_hal::i2c::I2c,
+    P: rp2040_hal::uart::ValidUartPinout<pac::UART1>,
+{
+    let _ = write!(uart, "STATUS LOCAL ");
+    for (slot, state) in controlled_pins.local.states.iter().enumerate() {
+        let separator = if slot + 1 == LOCAL_SLOT_COUNT {
+            "\r\n"
+        } else {
+            " "
+        };
+        let _ = write!(uart, "P{}={}{}", slot + 1, state.label(), separator);
+    }
+
+    match &controlled_pins.expander {
+        ExpanderState::Ready(expander) => {
+            let _ = write!(
+                uart,
+                "STATUS MCP23017 count={} SDA=GP{} SCL=GP{}\r\n",
+                expander.count(),
+                MCP23017_SDA_PIN,
+                MCP23017_SCL_PIN,
+            );
+
+            for device_index in 0..expander.count() {
+                let Some(device) = expander.device(device_index) else {
+                    continue;
+                };
+
+                let start = LOCAL_SLOT_COUNT + device_index * EXPANDER_SLOT_COUNT + 1;
+                let end = start + EXPANDER_SLOT_COUNT - 1;
+                let _ = write!(
+                    uart,
+                    "STATUS E{} addr=0x{:02X} slots=P{}..P{}\r\n",
+                    device_index + 1,
+                    device.address(),
+                    start,
+                    end,
+                );
+
+                let _ = write!(uart, "STATUS E{}A ", device_index + 1);
+                for (pin, state) in device.states()[..8].iter().enumerate() {
+                    let separator = if pin == 7 { "\r\n" } else { " " };
+                    let _ = write!(
+                        uart,
+                        "E{}X{}={}{}",
+                        device_index + 1,
+                        pin + 1,
+                        state.label(),
+                        separator,
+                    );
+                }
+
+                let _ = write!(uart, "STATUS E{}B ", device_index + 1);
+                for (pin, state) in device.states()[8..].iter().enumerate() {
+                    let separator = if pin == 7 { "\r\n" } else { " " };
+                    let _ = write!(
+                        uart,
+                        "E{}X{}={}{}",
+                        device_index + 1,
+                        pin + 9,
+                        state.label(),
+                        separator,
+                    );
+                }
+            }
+        }
+        ExpanderState::NotFound => {
+            let _ = write!(
+                uart,
+                "STATUS MCP23017=not-detected SDA=GP{} SCL=GP{}\r\n",
+                MCP23017_SDA_PIN, MCP23017_SCL_PIN,
+            );
+        }
+        ExpanderState::Fault => {
+            let _ = write!(uart, "STATUS MCP23017=probe-failed\r\n");
+        }
+    }
+}
+
+fn write_pin_label<P>(
+    slot: usize,
+    uart: &mut UartPeripheral<rp2040_hal::uart::Enabled, pac::UART1, P>,
+) where
+    P: rp2040_hal::uart::ValidUartPinout<pac::UART1>,
+{
+    if slot < LOCAL_SLOT_COUNT {
+        let _ = write!(uart, "GP{}(P{})", CONTROL_PINS[slot], slot + 1);
+        return;
+    }
+
+    let expander_slot = slot - LOCAL_SLOT_COUNT;
+    let expander_index = expander_slot / EXPANDER_SLOT_COUNT;
+    let device_pin = expander_slot % EXPANDER_SLOT_COUNT;
+    let bank = if device_pin < 8 { 'A' } else { 'B' };
+    let bit = device_pin % 8;
+
+    let _ = write!(
+        uart,
+        "E{}.GP{}{}(P{}/E{}X{})",
+        expander_index + 1,
+        bank,
+        bit,
+        slot + 1,
+        expander_index + 1,
+        device_pin + 1,
+    );
 }
 
 fn parse_command(line: &str) -> Result<ParsedCommand, &'static str> {
@@ -347,63 +694,100 @@ fn parse_command(line: &str) -> Result<ParsedCommand, &'static str> {
 }
 
 fn parse_slot(token: &str) -> Result<usize, &'static str> {
-    if token.eq_ignore_ascii_case("P1")
-        || token.eq_ignore_ascii_case("1")
-        || token.eq_ignore_ascii_case("GP2")
-    {
-        return Ok(0);
+    if let Some(slot) = parse_prefixed_1_based(token, "P", TOTAL_SLOT_CAPACITY) {
+        return Ok(slot - 1);
     }
 
-    if token.eq_ignore_ascii_case("P2")
-        || token.eq_ignore_ascii_case("2")
-        || token.eq_ignore_ascii_case("GP3")
-    {
-        return Ok(1);
+    if let Ok(slot) = token.parse::<usize>() {
+        if (1..=TOTAL_SLOT_CAPACITY).contains(&slot) {
+            return Ok(slot - 1);
+        }
     }
 
-    if token.eq_ignore_ascii_case("P3")
-        || token.eq_ignore_ascii_case("3")
-        || token.eq_ignore_ascii_case("GP4")
-    {
-        return Ok(2);
+    if let Some(pin) = parse_prefixed_1_based(token, "GP", 9) {
+        if (2..=9).contains(&pin) {
+            return Ok(pin - 2);
+        }
     }
 
-    if token.eq_ignore_ascii_case("P4")
-        || token.eq_ignore_ascii_case("4")
-        || token.eq_ignore_ascii_case("GP5")
-    {
-        return Ok(3);
+    if let Some(slot) = parse_expander_scoped_slot(token) {
+        return Ok(slot);
     }
 
-    if token.eq_ignore_ascii_case("P5")
-        || token.eq_ignore_ascii_case("5")
-        || token.eq_ignore_ascii_case("GP6")
-    {
-        return Ok(4);
+    if let Some(slot) = parse_prefixed_1_based(token, "X", EXPANDER_SLOT_COUNT) {
+        return Ok(LOCAL_SLOT_COUNT + slot - 1);
     }
 
-    if token.eq_ignore_ascii_case("P6")
-        || token.eq_ignore_ascii_case("6")
-        || token.eq_ignore_ascii_case("GP7")
-    {
-        return Ok(5);
+    if let Some(slot) = parse_prefixed_1_based(token, "M", EXPANDER_SLOT_COUNT) {
+        return Ok(LOCAL_SLOT_COUNT + slot - 1);
     }
 
-    if token.eq_ignore_ascii_case("P7")
-        || token.eq_ignore_ascii_case("7")
-        || token.eq_ignore_ascii_case("GP8")
-    {
-        return Ok(6);
+    if let Some(bit) = parse_prefixed_0_based(token, "GPA", 8) {
+        return Ok(LOCAL_SLOT_COUNT + bit);
     }
 
-    if token.eq_ignore_ascii_case("P8")
-        || token.eq_ignore_ascii_case("8")
-        || token.eq_ignore_ascii_case("GP9")
-    {
-        return Ok(7);
+    if let Some(bit) = parse_prefixed_0_based(token, "GPB", 8) {
+        return Ok(LOCAL_SLOT_COUNT + 8 + bit);
     }
 
-    Err("unknown pin, use P1..P8 or GP2..GP9")
+    Err("unknown pin, use P1..P136, GP2..GP9, X1..X16, GPA0..GPB7, or E1X1..E8GPB7")
+}
+
+fn parse_expander_scoped_slot(token: &str) -> Option<usize> {
+    let suffix = strip_ascii_prefix(token, "E")?;
+    let digits_len = suffix
+        .bytes()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+
+    if digits_len == 0 {
+        return None;
+    }
+
+    let (expander_text, pin_text) = suffix.split_at(digits_len);
+    let expander_index = expander_text.parse::<usize>().ok()?;
+
+    if !(1..=MAX_EXPANDERS).contains(&expander_index) {
+        return None;
+    }
+
+    let base = LOCAL_SLOT_COUNT + (expander_index - 1) * EXPANDER_SLOT_COUNT;
+
+    if let Some(slot) = parse_prefixed_1_based(pin_text, "X", EXPANDER_SLOT_COUNT) {
+        return Some(base + slot - 1);
+    }
+
+    if let Some(slot) = parse_prefixed_1_based(pin_text, "M", EXPANDER_SLOT_COUNT) {
+        return Some(base + slot - 1);
+    }
+
+    if let Some(bit) = parse_prefixed_0_based(pin_text, "GPA", 8) {
+        return Some(base + bit);
+    }
+
+    if let Some(bit) = parse_prefixed_0_based(pin_text, "GPB", 8) {
+        return Some(base + 8 + bit);
+    }
+
+    None
+}
+
+fn parse_prefixed_1_based(token: &str, prefix: &str, max: usize) -> Option<usize> {
+    let suffix = strip_ascii_prefix(token, prefix)?;
+    let value = suffix.parse::<usize>().ok()?;
+    (1..=max).contains(&value).then_some(value)
+}
+
+fn parse_prefixed_0_based(token: &str, prefix: &str, max: usize) -> Option<usize> {
+    let suffix = strip_ascii_prefix(token, prefix)?;
+    let value = suffix.parse::<usize>().ok()?;
+    (value < max).then_some(value)
+}
+
+fn strip_ascii_prefix<'a>(token: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = token.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then_some(&token[prefix.len()..])
 }
 
 fn parse_state(token: &str) -> Result<DriveState, &'static str> {
@@ -432,18 +816,4 @@ fn parse_state(token: &str) -> Result<DriveState, &'static str> {
     }
 
     Err("unknown state, use HIGH, LOW, or HI-Z")
-}
-
-fn pin_label(slot: usize) -> &'static str {
-    match slot {
-        0 => "GP2(P1)",
-        1 => "GP3(P2)",
-        2 => "GP4(P3)",
-        3 => "GP5(P4)",
-        4 => "GP6(P5)",
-        5 => "GP7(P6)",
-        6 => "GP8(P7)",
-        7 => "GP9(P8)",
-        _ => "UNKNOWN",
-    }
 }
