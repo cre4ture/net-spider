@@ -18,6 +18,38 @@ exposed as tri-state channels:
 `HIGH` drives the pin high, `LOW` drives the pin low, and `HI-Z` makes the pin
 high impedance again.
 
+## MCP23017 expansion
+
+The firmware now supports up to eight external MCP23017 I2C expanders on the
+same bus and exposes their GPIOs as additional tri-state channels.
+
+### Wiring
+
+- `GP26` -> all MCP23017 `SDA`
+- `GP27` -> all MCP23017 `SCL`
+- `3V3(OUT)` -> all MCP23017 `VCC`
+- `GND` -> all MCP23017 `GND`
+
+Every MCP23017 on the bus needs a unique address via `A0`, `A1`, and `A2`.
+The firmware scans `0x20..0x27` at boot and enables every responding device it
+finds.
+
+The supported command mapping is:
+
+- `P9`..`P24` -> first MCP23017 (`E1`)
+- `P25`..`P40` -> second MCP23017 (`E2`)
+- ...
+- `P121`..`P136` -> eighth MCP23017 (`E8`)
+- `E1X1`..`E8X16` -> explicit per-expander pin aliases
+- `E1GPA0`..`E8GPB7` -> explicit bank/bit aliases
+- `X1`..`X16`, `M1`..`M16`, `GPA0`..`GPB7` -> legacy aliases for the first expander only
+
+`HI-Z` maps to input mode without pull-up on the MCP23017, so the line is no
+longer driven by the expander.
+
+Important: power the MCP23017 module from `3.3V` when it shares the bus directly
+with the RP2040. Many breakout boards pull `SDA` and `SCL` up to their supply rail.
+
 ## Default network settings
 
 - IP: `192.168.1.200`
@@ -38,6 +70,12 @@ STATUS
 P1 HIGH
 P5 LOW
 P8 HI-Z
+P12 HIGH
+P25 LOW
+X3 LOW
+E2X3 LOW
+GPA7 HIGH
+E2GPB0 HI-Z
 SET P4 H
 ALL Z
 ```
@@ -45,7 +83,11 @@ ALL Z
 Preferred state names are `HIGH`, `LOW`, and `HI-Z`. The parser also accepts
 these aliases:
 
-- Pin selectors: `P1`..`P8`, `1`..`8`, `GP2`..`GP9`
+- Pin selectors:
+  - Local: `P1`..`P8`, `1`..`8`, `GP2`..`GP9`
+  - Global expander slots: `P9`..`P136`, `9`..`136`
+  - First expander aliases: `X1`..`X16`, `M1`..`M16`, `GPA0`..`GPA7`, `GPB0`..`GPB7`
+  - Explicit expander aliases: `E1X1`..`E8X16`, `E1GPA0`..`E8GPA7`, `E1GPB0`..`E8GPB7`
 - High: `H`, `ON`, `1`
 - Low: `L`, `OFF`, `0`
 - High impedance: `Z`, `NEUTRAL`, `FLOAT`
