@@ -42,6 +42,9 @@ jobs:
       - name: Build release firmware
         run: cargo build --release --target $TARGET
 
+      - name: Install system dependencies for UF2 packer
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev
+
       - name: Install UF2 packer
         run: cargo install elf2uf2-rs --locked
 

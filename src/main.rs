@@ -224,11 +224,12 @@ where
     }
 
     fn set_all(&mut self, state: DriveState) -> Result<(), &'static str> {
+        self.local.set_all(state);
+
         if let ExpanderState::Ready(expander) = &mut self.expander {
             expander.set_all(state)?;
         }
 
-        self.local.set_all(state);
         Ok(())
     }
 
