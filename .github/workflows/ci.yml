@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  TARGET: thumbv6m-none-eabi
+
+jobs:
+  firmware:
+    name: Firmware Checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET }}
+          components: rustfmt, clippy
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Lint firmware
+        run: cargo clippy --release --target $TARGET -- -D warnings
+
+      - name: Build release firmware
+        run: cargo build --release --target $TARGET
+
+      - name: Upload release ELF
+        uses: actions/upload-artifact@v4
+        with:
+          name: net-spider-${{ env.TARGET }}-release
+          path: target/${{ env.TARGET }}/release/net-spider
+          if-no-files-found: error

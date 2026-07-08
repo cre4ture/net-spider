@@ -256,7 +256,6 @@ fn main() -> ! {
         &mut pac.RESETS,
         &mut watchdog,
     )
-    .ok()
     .expect("clock tree should be initializable");
 
     let mut delay = Delay::new(core.SYST, clocks.system_clock.freq().to_Hz());
@@ -698,16 +697,16 @@ fn parse_slot(token: &str) -> Result<usize, &'static str> {
         return Ok(slot - 1);
     }
 
-    if let Ok(slot) = token.parse::<usize>() {
-        if (1..=TOTAL_SLOT_CAPACITY).contains(&slot) {
-            return Ok(slot - 1);
-        }
+    if let Ok(slot) = token.parse::<usize>()
+        && (1..=TOTAL_SLOT_CAPACITY).contains(&slot)
+    {
+        return Ok(slot - 1);
     }
 
-    if let Some(pin) = parse_prefixed_1_based(token, "GP", 9) {
-        if (2..=9).contains(&pin) {
-            return Ok(pin - 2);
-        }
+    if let Some(pin) = parse_prefixed_1_based(token, "GP", 9)
+        && (2..=9).contains(&pin)
+    {
+        return Ok(pin - 2);
     }
 
     if let Some(slot) = parse_expander_scoped_slot(token) {
